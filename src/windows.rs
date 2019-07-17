@@ -6,7 +6,7 @@
 //! [ref]: https://msdn.microsoft.com/en-us/library/windows/desktop/aa363950(v=vs.85).aspx
 
 use winapi::shared::minwindef::TRUE;
-use winapi::shared::winerror::ERROR_OPERATION_ABORTED;
+use winapi::shared::winerror::{ERROR_OPERATION_ABORTED, ERROR_SUCCESS};
 use winapi::um::fileapi;
 use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 use winapi::um::minwinbase::{LPOVERLAPPED, OVERLAPPED};
@@ -297,6 +297,20 @@ fn start_read(rd: &ReadData, event_tx: Arc<EventTx>, handle: HANDLE) {
     }
 }
 
+unsafe fn read_file_notify_path(
+    request: &ReadDirectoryRequest,
+    info: *const FILE_NOTIFY_INFORMATION
+) -> PathBuf {
+    // filename length is size in bytes, so / 2
+    let len = (*info).FileNameLength as usize / 2;
+    let encoded_path: &[u16] = slice::from_raw_parts((*info).FileName.as_ptr(), len);
+    // prepend root to get a full path
+    request
+        .data
+        .dir
+        .join(PathBuf::from(OsString::from_wide(encoded_path)))
+}
+
 unsafe extern "system" fn handle_event(
     error_code: u32,
     _bytes_written: u32,
@@ -305,9 +319,19 @@ unsafe extern "system" fn handle_event(
     let overlapped: Box<OVERLAPPED> = Box::from_raw(overlapped);
     let request: Box<ReadDirectoryRequest> = Box::from_raw(overlapped.hEvent as *mut _);
 
-    if error_code == ERROR_OPERATION_ABORTED {
-        // received when dir is unwatched or watcher is shutdown; return and let overlapped/request
-        // get drop-cleaned
+    if error_code != ERROR_SUCCESS {
+        if error_code != ERROR_OPERATION_ABORTED {
+            let err = Error::io(std::io::Error::from_raw_os_error(error_code as i32).into())
+                .add_path(read_file_notify_path(
+                    &request,
+                    request.buffer.as_ptr() as *const FILE_NOTIFY_INFORMATION,
+                ));
+
+            request.event_tx.send(Err(err)).ok();
+        }
+
+        // Either, the dir is unwatched, watcher is shutdown or an error occured; return and let
+        // overlapped/request get drop-cleaned
         kernel32::ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
         return;
     }
@@ -321,14 +345,7 @@ unsafe extern "system" fn handle_event(
     let mut cur_offset: *const u8 = request.buffer.as_ptr();
     let mut cur_entry: *const FILE_NOTIFY_INFORMATION = mem::transmute(cur_offset);
     loop {
-        // filename length is size in bytes, so / 2
-        let len = (*cur_entry).FileNameLength as usize / 2;
-        let encoded_path: &[u16] = slice::from_raw_parts((*cur_entry).FileName.as_ptr(), len);
-        // prepend root to get a full path
-        let path = request
-            .data
-            .dir
-            .join(PathBuf::from(OsString::from_wide(encoded_path)));
+        let path = read_file_notify_path(&request, cur_entry);
 
         // if we are watching a single file, ignore the event unless the path is exactly
         // the watched file
